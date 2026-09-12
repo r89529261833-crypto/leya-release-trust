@@ -1,46 +1,107 @@
 name: LEYA Sign Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      image_ref:
-        description: Exact immutable GHCR image reference (ghcr.io/...@sha256:...)
-        required: true
-        type: string
+  push:
+    branches: [main]
+    paths:
+      - release/image-ref.txt
 
 permissions:
   contents: read
   id-token: write
-  packages: read
-  attestations: write
+  packages: write
 
 jobs:
   sign-and-attest:
-    if: ${{ startsWith(inputs.image_ref, 'ghcr.io/r89529261833-crypto/leya-receiver@sha256:') }}
+    if: github.repository == 'r89529261833-crypto/leya-release-trust'
     runs-on: ubuntu-latest
     steps:
-      - name: Validate immutable image reference
+      - name: Checkout release intent
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          persist-credentials: false
+
+      - name: Validate exact immutable image reference
+        id: image
         shell: bash
         run: |
           set -euo pipefail
-          ref='${{ inputs.image_ref }}'
-          case "$ref" in
-            ghcr.io/r89529261833-crypto/leya-receiver@sha256:[0-9a-f][0-9a-f]*) ;;
-            *) echo 'Invalid or unauthorized image reference' >&2; exit 1 ;;
-          esac
+          ref="$(tr -d '\r\n' < release/image-ref.txt)"
+          if [[ ! "$ref" =~ ^ghcr\.io/r89529261833-crypto/leya-receiver@sha256:[0-9a-f]{64}$ ]]; then
+            echo 'Invalid or unauthorized image reference' >&2
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+          echo "digest=${ref##*@}" >> "$GITHUB_OUTPUT"
 
       - name: Install cosign
-        uses: sigstore/cosign-installer@v3
+        uses: sigstore/cosign-installer@398d4b0eeef1380460a10c8013a76f728fb906ac # v3.9.1
+
+      - name: Authenticate to GHCR with ephemeral workflow token
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$GH_TOKEN" | cosign login ghcr.io -u "$GITHUB_ACTOR" --password-stdin
 
       - name: Keyless sign exact digest
         env:
-          COSIGN_EXPERIMENTAL: '1'
-          IMAGE_REF: ${{ inputs.image_ref }}
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
         run: cosign sign --yes "$IMAGE_REF"
 
-      - name: Generate provenance attestation
-        uses: actions/attest-build-provenance@v2
-        with:
-          subject-name: ghcr.io/r89529261833-crypto/leya-receiver
-          subject-digest: ${{ fromJSON(format('{"sha256":"{0}"}', github.event.inputs.image_ref && split(github.event.inputs.image_ref, '@sha256:')[1] || '')) }}
-          push-to-registry: true
+      - name: Create SLSA provenance predicate
+        shell: bash
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          set -euo pipefail
+          now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          jq -n \
+            --arg builder "https://github.com/${GITHUB_REPOSITORY}/.github/workflows/leya-sign-release.yml@${GITHUB_REF}" \
+            --arg source "git+https://github.com/${GITHUB_REPOSITORY}@${GITHUB_SHA}" \
+            --arg sha "$GITHUB_SHA" \
+            --arg image "$IMAGE_REF" \
+            --arg run "${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}" \
+            --arg ts "$now" \
+            '{
+              builder: {id: $builder},
+              buildType: "https://leya.local/release-signing/v1",
+              invocation: {
+                configSource: {uri: $source, digest: {sha1: $sha}, entryPoint: ".github/workflows/leya-sign-release.yml"},
+                parameters: {image_ref: $image},
+                environment: {event: "push", ref: env.GITHUB_REF}
+              },
+              metadata: {
+                buildInvocationID: $run,
+                buildStartedOn: $ts,
+                buildFinishedOn: $ts,
+                completeness: {parameters: true, environment: false, materials: true},
+                reproducible: false
+              },
+              materials: [{uri: $source, digest: {sha1: $sha}}]
+            }' > provenance.json
+
+      - name: Keyless attest SLSA provenance
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: cosign attest --yes --type slsaprovenance --predicate provenance.json "$IMAGE_REF"
+
+      - name: Verify signature identity and issuer
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          cosign verify \
+            --certificate-identity "https://github.com/r89529261833-crypto/leya-release-trust/.github/workflows/leya-sign-release.yml@refs/heads/main" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$IMAGE_REF"
+
+      - name: Verify provenance identity and issuer
+        env:
+          IMAGE_REF: ${{ steps.image.outputs.ref }}
+        run: |
+          cosign verify-attestation \
+            --type slsaprovenance \
+            --certificate-identity "https://github.com/r89529261833-crypto/leya-release-trust/.github/workflows/leya-sign-release.yml@refs/heads/main" \
+            --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
+            "$IMAGE_REF"
