@@ -1,0 +1,46 @@
+name: LEYA Sign Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      image_ref:
+        description: Exact immutable GHCR image reference (ghcr.io/...@sha256:...)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+  id-token: write
+  packages: read
+  attestations: write
+
+jobs:
+  sign-and-attest:
+    if: ${{ startsWith(inputs.image_ref, 'ghcr.io/r89529261833-crypto/leya-receiver@sha256:') }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate immutable image reference
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref='${{ inputs.image_ref }}'
+          case "$ref" in
+            ghcr.io/r89529261833-crypto/leya-receiver@sha256:[0-9a-f][0-9a-f]*) ;;
+            *) echo 'Invalid or unauthorized image reference' >&2; exit 1 ;;
+          esac
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Keyless sign exact digest
+        env:
+          COSIGN_EXPERIMENTAL: '1'
+          IMAGE_REF: ${{ inputs.image_ref }}
+        run: cosign sign --yes "$IMAGE_REF"
+
+      - name: Generate provenance attestation
+        uses: actions/attest-build-provenance@v2
+        with:
+          subject-name: ghcr.io/r89529261833-crypto/leya-receiver
+          subject-digest: ${{ fromJSON(format('{"sha256":"{0}"}', github.event.inputs.image_ref && split(github.event.inputs.image_ref, '@sha256:')[1] || '')) }}
+          push-to-registry: true
